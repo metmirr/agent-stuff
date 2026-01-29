@@ -1,0 +1,12 @@
+{
+  "sessionId": "/Users/metin/.pi/agent/sessions/--Users-metin-Development-personal-active-agent-stuff--/2026-01-29T19-42-12-684Z_75d4d3aa-b59c-43a9-b754-b80b51c50593.jsonl",
+  "prompts": [
+    {
+      "id": "cf1b8293-bbf6-4c0a-8303-6f7200b6b8aa",
+      "text": "i created a new extension called pcommit: Tracks user prompts and links them to git commits",
+      "timestamp": 1769715766848
+    }
+  ],
+  "fileChanges": [],
+  "commits": []
+}

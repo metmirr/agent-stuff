@@ -28,11 +28,13 @@
  * Usage:
  *   1. Make changes using natural language prompts
  *   2. Stage your changes with `git add`
- *   3. Run `/pcommit` or `/pcommit <custom message>`
+ *   3. Run `/pcommit` (choose manual or AI-generated message)
+ *      or `/pcommit <custom message>` to skip the prompt
  */
 
 import type {
   ExtensionAPI,
+  ExtensionCommandContext,
   ExtensionContext,
 } from "@mariozechner/pi-coding-agent";
 import path from "node:path";
@@ -47,6 +49,7 @@ import { randomUUID } from "node:crypto";
 const DATA_DIR_NAME = ".pi/prompt-commit";
 const SETTINGS_FILE_NAME = "settings.json";
 const SESSION_MAP_FILE_NAME = "session-map.json";
+const COMMIT_SUBJECT_MAX = 72;
 
 const DEFAULT_SETTINGS: PromptCommitSettings = {
   truncateLength: 76,
@@ -361,25 +364,50 @@ function truncateText(text: string, maxLength: number): string {
   return firstLine.slice(0, maxLength - 3) + "...";
 }
 
+function normalizeCommitMessage(
+  message: string,
+  maxSubjectLength: number,
+): string {
+  const trimmed = message.trim();
+  if (!trimmed) return "";
+
+  const lines = trimmed.split("\n");
+  const subject = truncateText(lines[0].trim(), maxSubjectLength);
+  const body = lines.slice(1).join("\n").trimEnd();
+
+  return body ? `${subject}\n${body}` : subject;
+}
+
 function formatPromptForCommit(text: string, maxLength: number): string {
   return `- ${truncateText(text, maxLength - 2)}`;
 }
 
+function cleanGeneratedCommitMessage(message: string): string {
+  let cleaned = message.trim();
+
+  if (cleaned.startsWith("```")) {
+    cleaned = cleaned.replace(/^```[a-zA-Z]*\n?/, "");
+    cleaned = cleaned.replace(/```$/, "");
+  }
+
+  cleaned = cleaned.replace(/^commit message:\s*/i, "");
+  cleaned = cleaned.replace(/^["'`]+|["'`]+$/g, "");
+
+  const lines = cleaned
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+
+  return lines[0] ?? "";
+}
+
 function buildCommitMessage(
-  userMessage: string | undefined,
+  baseMessage: string,
   prompts: TrackedPrompt[],
   sessionId: string,
   settings: PromptCommitSettings,
 ): string {
-  let message: string;
-
-  if (userMessage && userMessage.trim()) {
-    message = userMessage.trim();
-  } else if (prompts.length > 0) {
-    message = truncateText(prompts[0].text, 72);
-  } else {
-    message = "Changes made with AI assistance";
-  }
+  let message = baseMessage.trim();
 
   if (prompts.length > 0) {
     message += "\n\nAI-Prompts:";
@@ -393,6 +421,44 @@ function buildCommitMessage(
   }
 
   return message;
+}
+
+function extractTextContent(content: unknown): string {
+  if (typeof content === "string") return content;
+
+  if (Array.isArray(content)) {
+    return content
+      .map((item) => {
+        if (!item || typeof item !== "object") return "";
+        const typed = item as { type?: string; text?: string };
+        if (typed.type === "text" && typeof typed.text === "string") {
+          return typed.text;
+        }
+        return "";
+      })
+      .filter((text) => text.length > 0)
+      .join("");
+  }
+
+  return "";
+}
+
+function findLatestAssistantMessageText(entries: unknown[]): string | null {
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index] as {
+      type?: string;
+      message?: { role?: string; content?: unknown };
+    };
+
+    if (entry?.type !== "message" || entry.message?.role !== "assistant") {
+      continue;
+    }
+
+    const content = extractTextContent(entry.message.content);
+    if (content.trim()) return content;
+  }
+
+  return null;
 }
 
 // =============================================================================
@@ -502,32 +568,97 @@ async function getStagedFiles(pi: ExtensionAPI): Promise<string[]> {
     .filter((f) => f.length > 0);
 }
 
+async function getStagedDiffSummary(pi: ExtensionAPI): Promise<string> {
+  const { stdout: nameStatus, code: nameCode } = await pi.exec("git", [
+    "diff",
+    "--cached",
+    "--name-status",
+  ]);
+  const { stdout: stat, code: statCode } = await pi.exec("git", [
+    "diff",
+    "--cached",
+    "--stat",
+  ]);
+
+  const sections: string[] = [];
+
+  if (nameCode === 0 && nameStatus.trim()) {
+    sections.push(`Files:\n${nameStatus.trim()}`);
+  }
+
+  if (statCode === 0 && stat.trim()) {
+    sections.push(`Summary:\n${stat.trim()}`);
+  }
+
+  return sections.join("\n\n");
+}
+
 async function createCommit(
   pi: ExtensionAPI,
   message: string,
 ): Promise<{ hash: string } | { error: string }> {
-  const { stdout, stderr, code } = await pi.exec("git", [
-    "commit",
-    "-m",
-    message,
-  ]);
-  if (code !== 0) {
-    return { error: stderr || stdout || "Commit failed" };
-  }
-
-  const { stdout: hashOutput, code: hashCode } = await pi.exec("git", [
-    "rev-parse",
-    "HEAD",
-  ]);
-  if (hashCode !== 0) {
-    return { error: "Failed to get commit hash" };
-  }
-
-  return { hash: hashOutput.trim() };
-}
 
 function formatCommitHash(hash: string): string {
   return hash.slice(0, 7);
+}
+
+// =============================================================================
+// Commit Message Generation
+// =============================================================================
+
+async function generateCommitMessageWithAgent(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  stagedFiles: string[],
+  settings: PromptCommitSettings,
+): Promise<string | null> {
+  if (!ctx.isIdle()) {
+    if (ctx.hasUI) {
+      ctx.ui.notify("Agent is busy. Try again once it's idle.", "warning");
+    }
+    return null;
+  }
+
+  const diffSummary = await getStagedDiffSummary(pi);
+  const filesSummary = stagedFiles.map((file) => `- ${file}`).join("\n");
+  const prompt = [
+    "Generate a concise git commit message for the staged changes below.",
+    "Return only the commit message text (no quotes, no markdown).",
+    diffSummary
+      ? `Staged changes:\n${diffSummary}`
+      : `Staged files:\n${filesSummary}`,
+  ].join("\n\n");
+
+  const entryCount = ctx.sessionManager.getEntries().length;
+  const activeTools = pi.getActiveTools();
+
+  try {
+    if (activeTools.length > 0) {
+      pi.setActiveTools([]);
+    }
+
+    if (ctx.hasUI) {
+      ctx.ui.setStatus("pcommit", "Generating commit message...");
+    }
+
+    await pi.sendUserMessage(prompt);
+    await ctx.waitForIdle();
+  } finally {
+    if (ctx.hasUI) {
+      ctx.ui.setStatus("pcommit", undefined);
+    }
+
+    pi.setActiveTools(activeTools);
+  }
+
+  const newEntries = ctx.sessionManager.getEntries().slice(entryCount);
+  const assistantText = findLatestAssistantMessageText(newEntries);
+  if (!assistantText) return null;
+
+  const cleaned = cleanGeneratedCommitMessage(assistantText);
+  const normalized = normalizeCommitMessage(cleaned, COMMIT_SUBJECT_MAX);
+
+  return normalized.trim() ? normalized : null;
 }
 
 // =============================================================================
@@ -600,6 +731,10 @@ export default function promptCommitExtension(pi: ExtensionAPI) {
   // ---------------------------------------------------------------------------
 
   pi.on("input", async (event, ctx) => {
+    if (event.source === "extension") {
+      return { action: "continue" as const };
+    }
+
     // Ensure state is initialized
     if (!state.repoRoot) {
       state.repoRoot = await getGitRoot(pi);
@@ -743,10 +878,75 @@ export default function promptCommitExtension(pi: ExtensionAPI) {
         ctx.cwd,
       );
 
-      // Build commit message
       const settings = await readSettings(state.repoRoot);
+      const trimmedArgs = args?.trim();
+      let commitMessageInput: string | null = null;
+
+      if (trimmedArgs) {
+        commitMessageInput = trimmedArgs;
+      } else if (ctx.hasUI) {
+        const choice = await ctx.ui.select("Commit message:", [
+          "Enter manually",
+          "Generate with agent",
+        ]);
+
+        if (!choice) {
+          ctx.ui.notify("Commit cancelled.", "warning");
+          return;
+        }
+
+        if (choice === "Enter manually") {
+          const manual = await ctx.ui.editor("Commit message:", "");
+          if (!manual || !manual.trim()) {
+            ctx.ui.notify("Commit message is required.", "warning");
+            return;
+          }
+          commitMessageInput = manual.trim();
+        } else {
+          commitMessageInput = await generateCommitMessageWithAgent(
+            pi,
+            ctx,
+            stagedFiles,
+            settings,
+          );
+          if (!commitMessageInput) {
+            ctx.ui.notify("Commit message generation failed.", "error");
+            return;
+          }
+        }
+      } else {
+        commitMessageInput = await generateCommitMessageWithAgent(
+          pi,
+          ctx,
+          stagedFiles,
+          settings,
+        );
+        if (!commitMessageInput) {
+          return;
+        }
+      }
+
+      if (!commitMessageInput) {
+        if (ctx.hasUI) {
+          ctx.ui.notify("Commit message is required.", "warning");
+        }
+        return;
+      }
+
+      const baseCommitMessage = normalizeCommitMessage(
+        commitMessageInput,
+        COMMIT_SUBJECT_MAX,
+      );
+
+      if (!baseCommitMessage) {
+        if (ctx.hasUI) {
+          ctx.ui.notify("Commit message is required.", "warning");
+        }
+        return;
+      }
+
       const commitMessage = buildCommitMessage(
-        args,
+        baseCommitMessage,
         linkedPrompts,
         state.sessionId,
         settings,

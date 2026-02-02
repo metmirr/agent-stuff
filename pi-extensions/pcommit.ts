@@ -5,9 +5,9 @@
  * trail of AI-assisted changes. Zero dependencies - just copy this file to
  * your pi extensions directory.
  *
- * Data is stored per-repository in .pi/prompt-commit/<session-id>.json:
+ * Data is stored per-repository in .pi/prompt-commit/<uuid>.json:
  * {
- *   "sessionId": "2026-01-29-abc123.json",
+ *   "sessionId": "550e8400-e29b-41d4-a716-446655440000",
  *   "prompts": [
  *     { "id": "...", "text": "add login form", "timestamp": 1706540000000 }
  *   ],
@@ -31,7 +31,10 @@
  *   3. Run `/pcommit` or `/pcommit <custom message>`
  */
 
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+} from "@mariozechner/pi-coding-agent";
 import path from "node:path";
 import fs from "node:fs/promises";
 import { existsSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
@@ -43,6 +46,7 @@ import { randomUUID } from "node:crypto";
 
 const DATA_DIR_NAME = ".pi/prompt-commit";
 const SETTINGS_FILE_NAME = "settings.json";
+const SESSION_MAP_FILE_NAME = "session-map.json";
 
 const DEFAULT_SETTINGS: PromptCommitSettings = {
   truncateLength: 76,
@@ -87,6 +91,8 @@ interface SessionData {
   commits: CommitRecord[];
 }
 
+type SessionMap = Record<string, string>;
+
 interface PendingChange {
   toolCallId: string;
   filePath: string;
@@ -103,6 +109,10 @@ function getDataDir(repoRoot: string): string {
 
 function getSettingsPath(repoRoot: string): string {
   return path.join(getDataDir(repoRoot), SETTINGS_FILE_NAME);
+}
+
+function getSessionMapPath(repoRoot: string): string {
+  return path.join(getDataDir(repoRoot), SESSION_MAP_FILE_NAME);
 }
 
 function sanitizeSessionId(sessionId: string): string {
@@ -122,14 +132,18 @@ function getShortSessionId(sessionId: string): string {
 // Settings
 // =============================================================================
 
-function normalizeSettings(raw: Partial<PromptCommitSettings>): PromptCommitSettings {
+function normalizeSettings(
+  raw: Partial<PromptCommitSettings>,
+): PromptCommitSettings {
   return {
-    truncateLength: typeof raw.truncateLength === "number" 
-      ? Math.max(20, Math.floor(raw.truncateLength)) 
-      : DEFAULT_SETTINGS.truncateLength,
-    includeSession: typeof raw.includeSession === "boolean" 
-      ? raw.includeSession 
-      : DEFAULT_SETTINGS.includeSession,
+    truncateLength:
+      typeof raw.truncateLength === "number"
+        ? Math.max(20, Math.floor(raw.truncateLength))
+        : DEFAULT_SETTINGS.truncateLength,
+    includeSession:
+      typeof raw.includeSession === "boolean"
+        ? raw.includeSession
+        : DEFAULT_SETTINGS.includeSession,
   };
 }
 
@@ -154,6 +168,46 @@ function readSettingsSync(repoRoot: string): PromptCommitSettings {
 }
 
 // =============================================================================
+// Session Map
+// =============================================================================
+
+async function readSessionMap(repoRoot: string): Promise<SessionMap> {
+  const mapPath = getSessionMapPath(repoRoot);
+  try {
+    const raw = await fs.readFile(mapPath, "utf8");
+    const parsed = JSON.parse(raw) as SessionMap;
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+async function writeSessionMap(
+  repoRoot: string,
+  sessionMap: SessionMap,
+): Promise<void> {
+  await ensureDataDir(repoRoot);
+  const mapPath = getSessionMapPath(repoRoot);
+  await fs.writeFile(mapPath, JSON.stringify(sessionMap, null, 2), "utf8");
+}
+
+async function getOrCreateSessionId(
+  repoRoot: string,
+  ctx: ExtensionContext,
+): Promise<string> {
+  const rawSessionId =
+    ctx.sessionManager.getSessionFile() ?? `ephemeral-${Date.now()}`;
+  const sessionMap = await readSessionMap(repoRoot);
+  const existing = sessionMap[rawSessionId];
+  if (existing) return existing;
+
+  const newId = randomUUID();
+  sessionMap[rawSessionId] = newId;
+  await writeSessionMap(repoRoot, sessionMap);
+  return newId;
+}
+
+// =============================================================================
 // Session Data Storage
 // =============================================================================
 
@@ -174,7 +228,10 @@ function ensureDataDirSync(repoRoot: string): void {
   mkdirSync(getDataDir(repoRoot), { recursive: true });
 }
 
-async function readSessionData(repoRoot: string, sessionId: string): Promise<SessionData> {
+async function readSessionData(
+  repoRoot: string,
+  sessionId: string,
+): Promise<SessionData> {
   const filePath = getSessionFilePath(repoRoot, sessionId);
   try {
     const content = await fs.readFile(filePath, "utf8");
@@ -194,7 +251,10 @@ function readSessionDataSync(repoRoot: string, sessionId: string): SessionData {
   }
 }
 
-async function writeSessionData(repoRoot: string, data: SessionData): Promise<void> {
+async function writeSessionData(
+  repoRoot: string,
+  data: SessionData,
+): Promise<void> {
   await ensureDataDir(repoRoot);
   const filePath = getSessionFilePath(repoRoot, data.sessionId);
   await fs.writeFile(filePath, JSON.stringify(data, null, 2), "utf8");
@@ -224,7 +284,7 @@ function addFileChange(
   data: SessionData,
   promptId: string,
   filePath: string,
-  toolName: string
+  toolName: string,
 ): void {
   data.fileChanges.push({
     id: randomUUID(),
@@ -239,7 +299,7 @@ function addCommit(
   data: SessionData,
   commitHash: string,
   message: string,
-  promptIds: string[]
+  promptIds: string[],
 ): void {
   data.commits.push({
     id: randomUUID(),
@@ -250,14 +310,17 @@ function addCommit(
   });
 }
 
-function findPromptById(data: SessionData, promptId: string): TrackedPrompt | undefined {
+function findPromptById(
+  data: SessionData,
+  promptId: string,
+): TrackedPrompt | undefined {
   return data.prompts.find((p) => p.id === promptId);
 }
 
 function findPromptsForFiles(
   data: SessionData,
   stagedFiles: string[],
-  cwd: string
+  cwd: string,
 ): TrackedPrompt[] {
   const promptIds = new Set<string>();
 
@@ -306,7 +369,7 @@ function buildCommitMessage(
   userMessage: string | undefined,
   prompts: TrackedPrompt[],
   sessionId: string,
-  settings: PromptCommitSettings
+  settings: PromptCommitSettings,
 ): string {
   let message: string;
 
@@ -344,7 +407,10 @@ function extractFilesFromBashCommand(command: string): string[] {
   const trimmed = command.trim();
   const files: string[] = [];
 
-  const patterns: Array<{ regex: RegExp; extract: (match: RegExpMatchArray) => string[] }> = [
+  const patterns: Array<{
+    regex: RegExp;
+    extract: (match: RegExpMatchArray) => string[];
+  }> = [
     // touch <file> [<file>...]
     {
       regex: /^touch\s+(.+)$/,
@@ -404,9 +470,7 @@ function extractFilesFromBashCommand(command: string): string[] {
 }
 
 function parseSpaceSeparatedArgs(argsStr: string): string[] {
-  return argsStr
-    .split(/\s+/)
-    .filter((p) => p && !p.startsWith("-"));
+  return argsStr.split(/\s+/).filter((p) => p && !p.startsWith("-"));
 }
 
 // =============================================================================
@@ -414,7 +478,10 @@ function parseSpaceSeparatedArgs(argsStr: string): string[] {
 // =============================================================================
 
 async function getGitRoot(pi: ExtensionAPI): Promise<string | null> {
-  const { stdout, code } = await pi.exec("git", ["rev-parse", "--show-toplevel"]);
+  const { stdout, code } = await pi.exec("git", [
+    "rev-parse",
+    "--show-toplevel",
+  ]);
   return code === 0 ? stdout.trim() : null;
 }
 
@@ -423,7 +490,11 @@ async function isGitRepo(pi: ExtensionAPI): Promise<boolean> {
 }
 
 async function getStagedFiles(pi: ExtensionAPI): Promise<string[]> {
-  const { stdout, code } = await pi.exec("git", ["diff", "--cached", "--name-only"]);
+  const { stdout, code } = await pi.exec("git", [
+    "diff",
+    "--cached",
+    "--name-only",
+  ]);
   if (code !== 0) return [];
   return stdout
     .trim()
@@ -433,14 +504,21 @@ async function getStagedFiles(pi: ExtensionAPI): Promise<string[]> {
 
 async function createCommit(
   pi: ExtensionAPI,
-  message: string
+  message: string,
 ): Promise<{ hash: string } | { error: string }> {
-  const { stdout, stderr, code } = await pi.exec("git", ["commit", "-m", message]);
+  const { stdout, stderr, code } = await pi.exec("git", [
+    "commit",
+    "-m",
+    message,
+  ]);
   if (code !== 0) {
     return { error: stderr || stdout || "Commit failed" };
   }
 
-  const { stdout: hashOutput, code: hashCode } = await pi.exec("git", ["rev-parse", "HEAD"]);
+  const { stdout: hashOutput, code: hashCode } = await pi.exec("git", [
+    "rev-parse",
+    "HEAD",
+  ]);
   if (hashCode !== 0) {
     return { error: "Failed to get commit hash" };
   }
@@ -477,14 +555,15 @@ function createInitialState(): ExtensionState {
 async function initializeState(
   state: ExtensionState,
   pi: ExtensionAPI,
-  ctx: ExtensionContext
+  ctx: ExtensionContext,
 ): Promise<void> {
   state.repoRoot = await getGitRoot(pi);
-  state.sessionId = ctx.sessionManager.getSessionFile() ?? `ephemeral-${Date.now()}`;
+  state.sessionId = null;
   state.currentPromptId = null;
   state.pendingChanges.clear();
 
   if (state.repoRoot) {
+    state.sessionId = await getOrCreateSessionId(state.repoRoot, ctx);
     state.sessionData = await readSessionData(state.repoRoot, state.sessionId);
   } else {
     state.sessionData = null;
@@ -531,10 +610,13 @@ export default function promptCommitExtension(pi: ExtensionAPI) {
     }
 
     if (!state.sessionId) {
-      state.sessionId = ctx.sessionManager.getSessionFile() ?? `ephemeral-${Date.now()}`;
+      state.sessionId = await getOrCreateSessionId(state.repoRoot, ctx);
     }
     if (!state.sessionData) {
-      state.sessionData = await readSessionData(state.repoRoot, state.sessionId);
+      state.sessionData = await readSessionData(
+        state.repoRoot,
+        state.sessionId,
+      );
     }
 
     // Track the prompt
@@ -585,7 +667,7 @@ export default function promptCommitExtension(pi: ExtensionAPI) {
 
     // Find pending changes for this tool call
     const matchingKeys = [...state.pendingChanges.keys()].filter(
-      (key) => state.pendingChanges.get(key)?.toolCallId === toolCallId
+      (key) => state.pendingChanges.get(key)?.toolCallId === toolCallId,
     );
 
     if (isError) {
@@ -604,7 +686,7 @@ export default function promptCommitExtension(pi: ExtensionAPI) {
           state.sessionData,
           state.currentPromptId,
           change.filePath,
-          change.toolName
+          change.toolName,
         );
         state.pendingChanges.delete(key);
       }
@@ -627,10 +709,24 @@ export default function promptCommitExtension(pi: ExtensionAPI) {
         return;
       }
 
+      // Stage all changes
+      const {
+        stdout: addStdout,
+        stderr: addStderr,
+        code: addCode,
+      } = await pi.exec("git", ["add", "-A"]);
+      if (addCode !== 0) {
+        ctx.ui.notify(
+          `Git add failed: ${addStderr || addStdout || "Unknown error"}`,
+          "error",
+        );
+        return;
+      }
+
       // Validate staged files
       const stagedFiles = await getStagedFiles(pi);
       if (stagedFiles.length === 0) {
-        ctx.ui.notify("No staged files. Use 'git add' first.", "warning");
+        ctx.ui.notify("No changes to commit.", "warning");
         return;
       }
 
@@ -644,7 +740,7 @@ export default function promptCommitExtension(pi: ExtensionAPI) {
       const linkedPrompts = findPromptsForFiles(
         state.sessionData,
         stagedFiles,
-        ctx.cwd
+        ctx.cwd,
       );
 
       // Build commit message
@@ -653,7 +749,7 @@ export default function promptCommitExtension(pi: ExtensionAPI) {
         args,
         linkedPrompts,
         state.sessionId,
-        settings
+        settings,
       );
 
       // Create the commit
@@ -668,7 +764,7 @@ export default function promptCommitExtension(pi: ExtensionAPI) {
         state.sessionData,
         result.hash,
         commitMessage,
-        linkedPrompts.map((p) => p.id)
+        linkedPrompts.map((p) => p.id),
       );
       saveState(state);
 
@@ -678,7 +774,7 @@ export default function promptCommitExtension(pi: ExtensionAPI) {
       const promptWord = promptCount === 1 ? "prompt" : "prompts";
       ctx.ui.notify(
         `Committed ${shortHash} with ${promptCount} linked ${promptWord}`,
-        "success"
+        "success",
       );
     },
   });
